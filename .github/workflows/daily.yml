@@ -1,0 +1,73 @@
+name: House PTR tracker
+
+# Schedule is expressed in UTC by GitHub, so the US Eastern intent is:
+#   22:30 UTC, Monday-Friday  =  18:30 America/New_York during EDT
+#                             =  17:30 America/New_York during EST
+# Both land on the same weekday in Eastern time, so no weekend run can occur.
+# House PTRs are posted during the business day; an evening ET run catches them.
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - dry-run
+          - seed
+      limit:
+        description: "Optional override for the per-run PDF cap"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: house-ptr-tracker
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build run flags
+        id: flags
+        run: |
+          MODE="${{ github.event.inputs.mode || 'normal' }}"
+          FLAGS=""
+          if [ "$MODE" = "dry-run" ]; then FLAGS="--dry-run"; fi
+          if [ "$MODE" = "seed" ]; then FLAGS="--seed"; fi
+          LIMIT="${{ github.event.inputs.limit }}"
+          if [ -n "$LIMIT" ]; then FLAGS="$FLAGS --limit $LIMIT"; fi
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "Running in mode '$MODE' with flags: $FLAGS"
+
+      - name: Run tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_SHEETS_CREDENTIALS_JSON: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python main.py ${{ steps.flags.outputs.flags }}

@@ -1,0 +1,39 @@
+# ── Credentials & secrets: NEVER commit ──────────────────────────────────
+.env
+.env.*
+!.env.example
+*credentials*.json
+*service_account*.json
+google_credentials.json
+client_secret*.json
+*.pem
+*.key
+token.json
+secrets.yaml
+secrets.yml
+
+# ── Local run artefacts ──────────────────────────────────────────────────
+cache/
+pdfs/
+*.pdf
+*.zip
+logs/
+*.log
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# ── Editors / OS ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
