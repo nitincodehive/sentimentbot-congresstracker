@@ -214,6 +214,9 @@ def run(args) -> int:
         "backlog": backlog,
         "universe_available": universe_available,
     }
+    # Filings actually alerted on this run. Backfilling seeded filings does
+    # not count, so a quiet run stays completely silent.
+    notified = 0
 
     # 7. Process one filing at a time; nothing here may crash the run.
     for i, filing in enumerate(queue, 1):
@@ -268,6 +271,7 @@ def run(args) -> int:
             )
             if telegram_send(message, dry_run=args.dry_run):
                 notify_status = "dry-run" if args.dry_run else "sent"
+                notified += 1
             else:
                 notify_status = "failed"
                 stats["notify_failed"] += 1
@@ -282,13 +286,22 @@ def run(args) -> int:
                 notes=notes,
             )
 
-    # 8. Summary (suppressed during seeding - a seed run sends nothing).
+    # 8. Summary. Sent only when the run had something to report, so that
+    #    silence reliably means "nothing new was filed":
+    #      - never during seeding
+    #      - not while quietly backfilling seeded filings
+    #      - always if a filing was alerted on, or a notification failed
     summary = format_summary(stats)
     logger.info("Run complete.\n%s", summary)
     if args.seed:
         logger.info("SEED MODE: no Telegram messages were sent, by design.")
-    elif queue:
+    elif notified or stats["notify_failed"]:
         telegram_send(summary, dry_run=args.dry_run)
+    else:
+        logger.info(
+            "Nothing to alert on (%d filing(s) backfilled); no summary sent.",
+            len(queue),
+        )
 
     return 0
 

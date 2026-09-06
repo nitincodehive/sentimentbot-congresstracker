@@ -56,6 +56,9 @@ are unchanged.
   cannot be fetched.
 - **Outbound only.** Telegram is used via `sendMessage` alone. No webhook is
   registered and no commands are received.
+- **Silence means nothing new.** A run-summary message is sent only when a
+  filing was actually alerted on (or a notification failed). Runs that merely
+  backfill seeded filings, and runs with nothing to do, send nothing at all.
 
 ## Message format
 
