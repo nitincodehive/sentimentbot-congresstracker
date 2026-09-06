@@ -106,3 +106,4 @@ during EDT, 17:30 during EST, always on a weekday in Eastern terms.
 | `formatter.py` | Message composition, lag-days derivation |
 | `universe.py` | Ticker universe from the Nasdaq screener API |
 | `config.py` | Editable non-secret configuration |
+| `CLAUDE.md` | Architecture, invariants and gotchas reference |
