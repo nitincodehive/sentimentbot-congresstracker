@@ -35,6 +35,12 @@ FETCH_DELAY_SECONDS = 1.5
 INDEX_TIMEOUT = 120
 PDF_TIMEOUT = 60
 
+# ── Ticker universe ───────────────────────────────────────────────────────
+# The largest N US-listed stocks by market cap, from the Nasdaq screener API
+# at runtime. Used only to decide which transactions are shown in full in the
+# Telegram message; the rest are compressed to a counted line.
+UNIVERSE_TARGET_SIZE = 3000
+
 # ── Telegram ──────────────────────────────────────────────────────────────
 # Telegram's hard limit is 4096; we split below this for safety.
 MAX_MESSAGE_CHARS = 4000

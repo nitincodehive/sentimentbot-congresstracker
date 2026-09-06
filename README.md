@@ -59,16 +59,19 @@ are unchanged.
 
 ## Message format
 
-One message per filing, split at 4000 characters. Transactions in tickers in
-the Russell 3000 (iShares IWV holdings, fetched at runtime, never committed)
-are listed in full; the rest are compressed to a single counted line. Members
-in `PRIORITY_MEMBERS` (in `config.py`) are surfaced first and marked.
+One message per filing, split at 4000 characters. Transactions in tickers
+inside the universe are listed in full; the rest are compressed to a single
+counted line. Members in `PRIORITY_MEMBERS` (in `config.py`) are surfaced
+first and marked.
 
-> **Known issue:** iShares currently serves the product page instead of the
-> holdings CSV for scripted requests from some networks. When the universe
-> cannot be loaded the run does not fail — it lists every transaction in full
-> and says so in the summary. If this persists on the Actions runner, the fix
-> belongs in `universe.py` alone.
+The universe is the largest `UNIVERSE_TARGET_SIZE` (3,000) US-listed stocks
+by market cap, from the Nasdaq screener API at runtime, never committed. This
+matches the source swingscanner moved to after iShares began serving its
+product page instead of the IWV holdings CSV for scripted clients. Non-equity
+lines (baby bonds, warrants, preferreds, rights) are excluded so they cannot
+displace real companies out of the ranking; ADRs are kept, since members trade
+them. If the universe cannot be loaded the run does not fail — it lists every
+transaction in full and says so in the summary.
 
 ## Usage
 
@@ -98,5 +101,5 @@ during EDT, 17:30 during EST, always on a weekday in Eastern terms.
 | `sheets_db.py` | gspread datastore (`filings`, `transactions`) |
 | `telegram_notify.py` | Outbound-only Telegram send + 4000-char splitting |
 | `formatter.py` | Message composition, lag-days derivation |
-| `universe.py` | Russell 3000 tickers from iShares IWV |
+| `universe.py` | Ticker universe from the Nasdaq screener API |
 | `config.py` | Editable non-secret configuration |
