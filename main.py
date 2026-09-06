@@ -49,10 +49,22 @@ def is_priority(filing) -> bool:
     return filing.last.strip().lower() in names
 
 
-def sort_key(filing):
-    """Priority members first, then most recent filing date first."""
+def sort_key(filing, record=None):
+    """Queue order: notifiable first, then priority members, then newest.
+
+    Notifiability outranks priority deliberately. A seeded filing can never
+    alert, so processing one is pure backfill; letting an old backfill item
+    outrank a genuinely new filing just because its member is on the priority
+    list would delay a real alert past the per-run cap. Priority still decides
+    the order among filings that can actually alert.
+    """
     date = parse_date(filing.filing_date)
-    return (0 if is_priority(filing) else 1, -(date.toordinal() if date else 0))
+    backfill_only = bool(record) and record.get("notify_status") == "seeded"
+    return (
+        1 if backfill_only else 0,
+        0 if is_priority(filing) else 1,
+        -(date.toordinal() if date else 0),
+    )
 
 
 def download_pdf(url: str):
@@ -178,20 +190,23 @@ def run(args) -> int:
     # 5. Work queue: anything not yet parsed, plus anything parsed but not
     #    yet notified. Priority members first, then newest.
     if args.dry_run:
-        queue = sorted(new_filings, key=sort_key)
+        queue = sorted(new_filings, key=lambda f: sort_key(f, None))
     else:
-        queue = sorted(
-            (
-                by_doc_id[doc_id]
-                for doc_id, rec in known.items()
-                if doc_id in by_doc_id
-                and (
-                    rec.get("parse_status", "") in ("", "pending")
-                    or rec.get("notify_status", "") in ("", "pending", "failed")
-                )
-            ),
-            key=sort_key,
-        )
+        queue = [
+            f
+            for f, _ in sorted(
+                (
+                    (by_doc_id[doc_id], rec)
+                    for doc_id, rec in known.items()
+                    if doc_id in by_doc_id
+                    and (
+                        rec.get("parse_status", "") in ("", "pending")
+                        or rec.get("notify_status", "") in ("", "pending", "failed")
+                    )
+                ),
+                key=lambda pair: sort_key(pair[0], pair[1]),
+            )
+        ]
 
     cap = args.limit or (
         config.MAX_PDFS_PER_SEED_RUN if args.seed else config.MAX_PDFS_PER_RUN
