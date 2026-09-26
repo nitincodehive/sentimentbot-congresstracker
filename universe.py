@@ -27,7 +27,7 @@ import re
 
 import requests
 
-from config import UNIVERSE_TARGET_SIZE
+from config import BROWSER_UA, UNIVERSE_TARGET_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +36,8 @@ NASDAQ_SCREENER_URL = (
     "?tableonly=true&limit=10000&download=true"
 )
 
-# The screener rejects non-browser clients, so this request does not use the
-# project's own descriptive User-Agent.
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
+# The screener rejects non-browser clients, so this request uses
+# config.BROWSER_UA rather than the project's own descriptive User-Agent.
 
 
 def _reject_html(text: str) -> None:

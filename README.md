@@ -1,8 +1,14 @@
 # sentimentbot-congresstracker
 
-Polls the US House Clerk's financial disclosure site once per weekday, detects
-newly filed **Periodic Transaction Reports (PTRs)**, parses the transactions,
-stores them in Google Sheets, and sends one Telegram message per new filing.
+Polls three official financial-disclosure sources once per weekday, detects
+newly filed trade reports, parses the transactions, stores them in Google
+Sheets, and sends one Telegram message per new filing:
+
+| Source | Covers | Report |
+| --- | --- | --- |
+| House Clerk | House members | Periodic Transaction Report (PTR) |
+| Senate eFD | Senators and Senate candidates | PTR |
+| OGE | President, Cabinet, other executive officials | OGE Form 278-T (directly downloadable ones) |
 
 Standalone project. It shares no code with `swingscanner`, `swingscanner-bot`,
 `market-signals` or `sentiment-bot-xsearch`.
@@ -35,25 +41,43 @@ supplied in CI as GitHub Actions secrets:
 Both URL patterns and the XML schema were confirmed against the live site and
 are unchanged.
 
+**Senate eFD** (`efdsearch.senate.gov`) is gated by a click-through agreement
+restating the legal limits on using disclosure reports (no commercial use,
+credit rating or solicitation). The bot accepts it at the start of each run;
+keep this tracker personal and non-commercial. E-filed Senate PTRs are HTML
+tables; paper ones are page images.
+
+**OGE** reports are read from the JSON API behind OGE's public disclosure
+search. Only 278-Ts with a direct PDF link are tracked; most executive-branch
+278-Ts are released only on a manual request form, which is not automated.
+
+See `CLAUDE.md` for the verified endpoint details.
+
 ## Behaviour
 
 - **DocID is the dedup key.** A filing is never notified twice.
-- **Seeding.** The first run must be `--seed`: it records the full year to date
-  with `notify_status = seeded` and sends nothing. Those rows can never notify
-  later. A normal run refuses to start against an empty sheet, and `--seed`
-  refuses to run against a populated one (override: `--force-reseed`).
-- **Parse failures are never dropped.** A filing whose PDF cannot be parsed is
-  still recorded with `parse_status = failed` and still triggers a Telegram
-  message naming the member with the PDF link. Roughly 13% of 2026 PTRs are
-  legacy paper scans with no text layer; these are detectable by their short
-  DocIDs and will always fail. Each run reports its parse failure rate so you
-  can judge later whether an LLM fallback is worth adding. **No LLM is used.**
-- **Backlog cap.** At most `MAX_PDFS_PER_RUN` (default 25) PDFs per run; the
-  remainder is picked up on following runs. `FETCH_DELAY_SECONDS` (default 1.5)
-  spaces out requests to the government server.
+- **Seeding, per source.** Each source must be seeded once with `--seed`: it
+  records that source's full year to date with `notify_status = seeded` and
+  sends nothing. Those rows can never notify later. A normal run skips (and
+  fails loudly on) any source that has never been seeded; `--seed` skips any
+  source already seeded (override: `--force-reseed`). After adding a source,
+  run the workflow once in `seed` mode.
+- **Parse failures are never dropped.** A filing whose document cannot be
+  parsed is still recorded with `parse_status = failed` and still triggers a
+  Telegram message naming the filer with the link. Roughly 13% of 2026 House
+  PTRs are legacy paper scans with no text layer, Senate paper filings are
+  page images, and the President's 2026 278-Ts are copier scans; all of these
+  fail and alert with the link. Every document is still run through the
+  parser, so a filer who e-files parses normally. A 278-T that parses only
+  partly counts as a failure rather than showing an incomplete list. Each run
+  reports its parse failure rate. **No LLM is used.**
+- **Backlog cap.** At most `MAX_PDFS_PER_RUN` (default 25) documents per
+  source per run; the remainder is picked up on following runs.
+  `FETCH_DELAY_SECONDS` (default 1.5) spaces out requests to the government
+  servers.
 - **Graceful degradation.** Individual download, parse, Sheets and Telegram
-  failures are logged and skipped. The run aborts only if the index itself
-  cannot be fetched.
+  failures are logged and skipped. A source whose index cannot be fetched is
+  skipped for that run while the others continue, and the run exits non-zero.
 - **Outbound only.** Telegram is used via `sendMessage` alone. No webhook is
   registered and no commands are received.
 - **Silence means nothing new.** A run-summary message is sent only when a
@@ -82,9 +106,10 @@ transaction in full and says so in the summary.
 pip install -r requirements.txt
 
 python main.py --dry-run            # console only; no Sheets, no Telegram
-python main.py --seed               # first run; records baseline, sends nothing
+python main.py --seed               # seeds unseeded sources; sends nothing
 python main.py                      # normal incremental run
-python main.py --limit 5            # override the per-run PDF cap
+python main.py --source senate      # one source only (house | senate | oge)
+python main.py --limit 5            # override the per-source document cap
 ```
 
 ## Schedule
@@ -92,15 +117,22 @@ python main.py --limit 5            # override the per-run PDF cap
 `.github/workflows/daily.yml` runs at `30 22 * * 1-5` UTC — 18:30 US Eastern
 during EDT, 17:30 during EST, always on a weekday in Eastern terms.
 `workflow_dispatch` allows manual runs and exposes a `mode` input
-(`normal` / `dry-run` / `seed`).
+(`normal` / `dry-run` / `seed`) and a `source` input (`all` / `house` /
+`senate` / `oge`).
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `main.py` | Orchestration, seeding guards, CLI |
-| `house_index.py` | ZIP/XML index fetch and PTR filter |
-| `ptr_parser.py` | pdfplumber PDF text parsing |
+| `main.py` | Orchestration, per-source seeding guards, CLI |
+| `sources.py` | Registry of sources: index, download, parse |
+| `filing.py` | Source-independent `Filing` record |
+| `house_index.py` | House ZIP/XML index fetch and PTR filter |
+| `senate_index.py` | Senate eFD agreement, PTR search, report download |
+| `oge_index.py` | OGE disclosure API, downloadable 278-Ts |
+| `ptr_parser.py` | House PTR PDF text parsing |
+| `senate_parser.py` | Senate PTR HTML table parsing |
+| `oge_parser.py` | 278-T PDF text parsing with completeness checks |
 | `sheets_db.py` | gspread datastore (`filings`, `transactions`) |
 | `telegram_notify.py` | Outbound-only Telegram send + 4000-char splitting |
 | `formatter.py` | Message composition, lag-days derivation |

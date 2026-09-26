@@ -1,10 +1,11 @@
-name: House PTR tracker
+name: Congress & executive trade tracker
 
 # Schedule is expressed in UTC by GitHub, so the US Eastern intent is:
 #   22:30 UTC, Monday-Friday  =  18:30 America/New_York during EDT
 #                             =  17:30 America/New_York during EST
 # Both land on the same weekday in Eastern time, so no weekend run can occur.
-# House PTRs are posted during the business day; an evening ET run catches them.
+# All three sources (House Clerk, Senate eFD, OGE) post during the business
+# day; an evening ET run catches them.
 on:
   schedule:
     - cron: "30 22 * * 1-5"
@@ -19,8 +20,18 @@ on:
           - normal
           - dry-run
           - seed
+      source:
+        description: "Source(s) to run; seed mode skips sources already seeded"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - house
+          - senate
+          - oge
       limit:
-        description: "Optional override for the per-run PDF cap"
+        description: "Optional override for the per-source, per-run document cap"
         required: false
         default: ""
         type: string
@@ -35,7 +46,7 @@ permissions:
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -59,6 +70,8 @@ jobs:
           FLAGS=""
           if [ "$MODE" = "dry-run" ]; then FLAGS="--dry-run"; fi
           if [ "$MODE" = "seed" ]; then FLAGS="--seed"; fi
+          SOURCE="${{ github.event.inputs.source || 'all' }}"
+          FLAGS="$FLAGS --source $SOURCE"
           LIMIT="${{ github.event.inputs.limit }}"
           if [ -n "$LIMIT" ]; then FLAGS="$FLAGS --limit $LIMIT"; fi
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"

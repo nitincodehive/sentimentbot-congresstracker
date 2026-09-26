@@ -18,11 +18,11 @@ import io
 import logging
 import zipfile
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
 
 import requests
 
 from config import INDEX_TIMEOUT, USER_AGENT
+from filing import Filing, IndexUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -32,28 +32,8 @@ PDF_URL = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/{year}/{doc_
 FILING_TYPE_PTR = "P"
 
 
-@dataclass
-class Filing:
-    doc_id: str
-    member: str
-    last: str
-    state_dst: str
-    filing_date: str  # as published, M/D/YYYY
-    year: str
-
-    @property
-    def pdf_url(self) -> str:
-        return PDF_URL.format(year=self.year, doc_id=self.doc_id)
-
-    @property
-    def is_scanned_legacy(self) -> bool:
-        """Legacy paper filings have short numeric DocIDs (e.g. 9116142) and
-        are image-only scans with no text layer — they will not parse."""
-        return len(self.doc_id) < 8
-
-
-class IndexUnavailable(RuntimeError):
-    """Raised when the index itself cannot be fetched — the only fatal error."""
+def pdf_url(year: str, doc_id: str) -> str:
+    return PDF_URL.format(year=year, doc_id=doc_id)
 
 
 def fetch_filings(year: int) -> list[Filing]:
@@ -96,11 +76,16 @@ def fetch_filings(year: int) -> list[Filing]:
             filings.append(
                 Filing(
                     doc_id=doc_id,
+                    source="house",
                     member=member or last or "(unknown)",
                     last=last,
-                    state_dst=(el.findtext("StateDst") or "").strip(),
                     filing_date=(el.findtext("FilingDate") or "").strip(),
-                    year=(el.findtext("Year") or str(year)).strip(),
+                    url=pdf_url((el.findtext("Year") or str(year)).strip(), doc_id),
+                    label="House PTR",
+                    detail=(el.findtext("StateDst") or "").strip(),
+                    # Legacy paper filings have short numeric DocIDs (e.g.
+                    # 9116142) and are image-only scans with no text layer.
+                    is_paper=len(doc_id) < 8,
                 )
             )
         except Exception as exc:  # never let one bad element kill the run

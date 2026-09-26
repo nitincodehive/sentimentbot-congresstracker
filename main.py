@@ -1,35 +1,35 @@
 """
-House PTR tracker - entry point.
+Congressional and executive-branch trade tracker - entry point.
 
-Once per weekday: pull the House Clerk year-to-date index, find newly filed
-Periodic Transaction Reports, parse their PDFs, store them in Google Sheets,
-and send one Telegram message per new filing.
+Once per weekday, for each enabled source (House Clerk PTRs, Senate eFD PTRs,
+OGE 278-Ts): pull the year-to-date index, find newly filed reports, parse
+them, store them in Google Sheets, and send one Telegram message per new
+filing.
 
 Modes
   (default)      incremental run; notifies on filings not seen before
-  --seed         first-ever run; records the full year to date and sends
-                 NOTHING to Telegram. Refuses to run if the sheet is
-                 already populated (see --force-reseed).
+  --seed         records each not-yet-seeded source's full year to date and
+                 sends NOTHING to Telegram. Sources already seeded are
+                 skipped (see --force-reseed).
   --dry-run      prints to console; writes to neither Sheets nor Telegram
+  --source NAME  restrict the run to one source
 
 Graceful degradation: any single filing that fails is logged, recorded and
-skipped. The only fatal condition is an unreachable index.
+skipped. A source whose index is unreachable is skipped for the run while
+the others continue; the run then exits non-zero.
 """
 
 import argparse
-import io
 import logging
 import sys
 import time
 from datetime import datetime
 
-import requests
-
 import config
 import sheets_db
+from filing import IndexUnavailable, source_of
 from formatter import format_filing_message, format_summary, lag_days, parse_date
-from house_index import IndexUnavailable, fetch_filings
-from ptr_parser import parse_ptr
+from sources import SOURCES
 from telegram_notify import send as telegram_send
 from universe import load_universe
 
@@ -67,20 +67,6 @@ def sort_key(filing, record=None):
     )
 
 
-def download_pdf(url: str):
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": config.USER_AGENT},
-            timeout=config.PDF_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.content
-    except Exception as exc:
-        logger.error("PDF download failed (%s): %s", url, exc)
-        return None
-
-
 def build_transaction_rows(filing, parsed, universe):
     rows = []
     for tx in parsed:
@@ -106,62 +92,62 @@ def build_transaction_rows(filing, parsed, universe):
 # -- Main -----------------------------------------------------------------
 
 
-def run(args) -> int:
-    year = args.year or datetime.now().year
+def process_source(source, args, year, known, sheet, universe, stats) -> str:
+    """Run one source end to end.
 
-    # 1. Index - the only fatal dependency.
+    Returns "ok", "skipped" (seeding requested but already seeded),
+    "not_seeded", "index_unavailable" or "sheets_error". Mutates `known`
+    (reloaded after new rows are appended) and `stats`.
+    """
+    filings_ws, transactions_ws = sheet
+    name = source.name
+
+    # 1. Index - fatal for this source only.
     try:
-        filings = fetch_filings(year)
+        filings = source.fetch_filings(year)
     except IndexUnavailable as exc:
-        logger.error("ABORTING: %s", exc)
-        return 1
+        logger.error("[%s] SKIPPING SOURCE: %s", name, exc)
+        stats["unavailable"].append(name)
+        return "index_unavailable"
 
     by_doc_id = {f.doc_id: f for f in filings}
-    logger.info("Index has %d PTR filings for %d", len(by_doc_id), year)
+    logger.info("[%s] Index has %d filings for %d", name, len(by_doc_id), year)
 
-    # 2. Sheets state.
-    known = {}
-    filings_ws = transactions_ws = None
-    if not args.dry_run:
-        try:
-            spreadsheet = sheets_db.init_sheets()
-            filings_ws, transactions_ws = sheets_db.ensure_tabs(spreadsheet)
-            known = sheets_db.load_filings(filings_ws)
-        except Exception as exc:
-            logger.error("ABORTING: Sheets unavailable: %s", exc)
-            return 1
-    else:
-        logger.info("[DRY RUN] Skipping Sheets; treating every filing as new.")
-
-    already_seeded = bool(known)
-
-    # 3. Seeding guards - explicit, and safe in both directions.
+    # 2. Seeding guards - per source, explicit, and safe in both directions.
+    #    A source counts as seeded once any of its rows is in the sheet, so a
+    #    source added later can never flood the channel with its backlog.
+    source_seeded = any(source_of(doc_id) == name for doc_id in known)
     if args.seed:
-        if already_seeded and not args.force_reseed:
-            logger.error(
-                "ABORTING: the filings tab already holds %d rows, so seeding has "
-                "already happened. Re-seeding would duplicate rows. Run without "
-                "--seed for a normal incremental run, or pass --force-reseed if "
-                "you have deliberately cleared the sheet.",
-                len(known),
+        if source_seeded and not args.force_reseed:
+            logger.info(
+                "[%s] Already seeded (%d rows); skipping. Pass --force-reseed "
+                "only after deliberately clearing this source's rows.",
+                name, sum(source_of(d) == name for d in known),
             )
-            return 1
+            return "skipped"
         logger.info(
-            "SEED MODE: recording the full year to date. "
-            "No Telegram messages will be sent."
+            "[%s] SEED MODE: recording the full year to date. "
+            "No Telegram messages will be sent.", name,
         )
-    elif not already_seeded and not args.dry_run:
+        if not by_doc_id:
+            logger.warning(
+                "[%s] Nothing to seed yet, so the next normal run will still "
+                "treat this source as unseeded.", name,
+            )
+    elif not source_seeded and not args.dry_run:
         logger.error(
-            "ABORTING: the filings tab is empty, so this repository has never "
-            "been seeded. A normal run would notify on all %d filings at once. "
-            "Run once with --seed first.",
-            len(by_doc_id),
+            "[%s] SKIPPING SOURCE: it has never been seeded. A normal run would "
+            "notify on all %d of its filings at once. Run once with --seed "
+            "(sources already seeded are skipped automatically).",
+            name, len(by_doc_id),
         )
-        return 1
+        return "not_seeded"
 
-    # 4. Reconcile on DocID, the dedup key.
+    # 3. Reconcile on doc_id, the dedup key.
     new_filings = [f for doc_id, f in by_doc_id.items() if doc_id not in known]
-    logger.info("New filings since last run: %d", len(new_filings))
+    logger.info("[%s] New filings since last run: %d", name, len(new_filings))
+    stats["new_filings"] += len(new_filings)
+    stats["new_by_source"][name] = len(new_filings)
 
     if not args.dry_run and new_filings:
         try:
@@ -172,7 +158,7 @@ def run(args) -> int:
                         "doc_id": f.doc_id,
                         "member": f.member,
                         "filing_date": f.filing_date,
-                        "pdf_url": f.pdf_url,
+                        "pdf_url": f.url,
                         "parse_status": "pending",
                         # Seeded filings are permanently excluded from alerts.
                         "notify_status": "seeded" if args.seed else "pending",
@@ -182,13 +168,14 @@ def run(args) -> int:
                     for f in new_filings
                 ],
             )
-            known = sheets_db.load_filings(filings_ws)
+            known.clear()
+            known.update(sheets_db.load_filings(filings_ws))
         except Exception as exc:
-            logger.error("ABORTING: could not record new filings: %s", exc)
-            return 1
+            logger.error("[%s] SKIPPING SOURCE: could not record new filings: %s", name, exc)
+            return "sheets_error"
 
-    # 5. Work queue: anything not yet parsed, plus anything parsed but not
-    #    yet notified. Priority members first, then newest.
+    # 4. Work queue: anything not yet parsed, plus anything parsed but not
+    #    yet notified. Notifiable first, then priority members, then newest.
     if args.dry_run:
         queue = sorted(new_filings, key=lambda f: sort_key(f, None))
     else:
@@ -212,30 +199,16 @@ def run(args) -> int:
         config.MAX_PDFS_PER_SEED_RUN if args.seed else config.MAX_PDFS_PER_RUN
     )
     backlog = max(0, len(queue) - cap)
+    stats["backlog"] += backlog
     queue = queue[:cap]
     logger.info(
-        "Processing %d filing(s) this run (%d left for next run)", len(queue), backlog
+        "[%s] Processing %d filing(s) this run (%d left for next run)",
+        name, len(queue), backlog,
     )
 
-    # 6. Universe (optional; degrades to "show everything").
-    universe = load_universe()
-    universe_available = bool(universe)
-
-    stats = {
-        "new_filings": len(new_filings),
-        "parse_ok": 0,
-        "parse_failed": 0,
-        "notify_failed": 0,
-        "backlog": backlog,
-        "universe_available": universe_available,
-    }
-    # Filings actually alerted on this run. Backfilling seeded filings does
-    # not count, so a quiet run stays completely silent.
-    notified = 0
-
-    # 7. Process one filing at a time; nothing here may crash the run.
+    # 5. Process one filing at a time; nothing here may crash the run.
     for i, filing in enumerate(queue, 1):
-        logger.info("[%d/%d] %s - doc %s", i, len(queue), filing.member, filing.doc_id)
+        logger.info("[%s %d/%d] %s - doc %s", name, i, len(queue), filing.member, filing.doc_id)
         record = known.get(filing.doc_id, {})
         row_number = record.get("_row")
         # A filing seeded into the baseline must never notify, even later.
@@ -245,12 +218,12 @@ def run(args) -> int:
             time.sleep(config.FETCH_DELAY_SECONDS)  # be polite to the server
 
         parsed, tx_rows, notes = [], [], ""
-        content = download_pdf(filing.pdf_url)
+        content = source.download(filing)
         if content is None:
-            notes = "pdf download failed"
+            notes = "download failed"
         else:
             try:
-                parsed = parse_ptr(io.BytesIO(content))
+                parsed = source.parse(content)
             except Exception as exc:
                 logger.error("Parse error for %s: %s", filing.doc_id, exc)
                 notes = ("parse error: %s" % exc)[:400]
@@ -263,8 +236,8 @@ def run(args) -> int:
             stats["parse_failed"] += 1
             if not notes:
                 notes = (
-                    "no text layer (legacy scan)"
-                    if filing.is_scanned_legacy
+                    "no text layer (paper filing)"
+                    if filing.is_paper
                     else "no transactions matched"
                 )
 
@@ -278,15 +251,15 @@ def run(args) -> int:
                 )
                 notes = (notes + " | tx write failed: %s" % exc)[:400]
 
-        # Notify. A parse failure still sends a message with the PDF link.
+        # Notify. A parse failure still sends a message with the link.
         notify_status = "seeded" if suppress_notify else "pending"
         if not suppress_notify:
             message = format_filing_message(
-                filing, tx_rows, parse_ok, universe_available, is_priority(filing)
+                filing, tx_rows, parse_ok, stats["universe_available"], is_priority(filing)
             )
             if telegram_send(message, dry_run=args.dry_run):
                 notify_status = "dry-run" if args.dry_run else "sent"
-                notified += 1
+                stats["notified"] += 1
             else:
                 notify_status = "failed"
                 stats["notify_failed"] += 1
@@ -301,7 +274,54 @@ def run(args) -> int:
                 notes=notes,
             )
 
-    # 8. Summary. Sent only when the run had something to report, so that
+    stats["processed"] += len(queue)
+    return "ok"
+
+
+def run(args) -> int:
+    year = args.year or datetime.now().year
+    names = config.ENABLED_SOURCES if args.source == "all" else [args.source]
+
+    # 1. Sheets state, shared by every source.
+    known = {}
+    sheet = (None, None)
+    if not args.dry_run:
+        try:
+            spreadsheet = sheets_db.init_sheets()
+            sheet = sheets_db.ensure_tabs(spreadsheet)
+            known = sheets_db.load_filings(sheet[0])
+        except Exception as exc:
+            logger.error("ABORTING: Sheets unavailable: %s", exc)
+            return 1
+    else:
+        logger.info("[DRY RUN] Skipping Sheets; treating every filing as new.")
+
+    # 2. Universe (optional; degrades to "show everything").
+    universe = load_universe()
+
+    stats = {
+        "new_filings": 0,
+        "new_by_source": {},
+        "processed": 0,
+        "parse_ok": 0,
+        "parse_failed": 0,
+        # Filings actually alerted on. Backfilling seeded filings does not
+        # count, so a quiet run stays completely silent.
+        "notified": 0,
+        "notify_failed": 0,
+        "backlog": 0,
+        "unavailable": [],
+        "universe_available": bool(universe),
+    }
+
+    # 3. Each source independently; one failing never stops the others.
+    outcomes = {
+        name: process_source(SOURCES[name], args, year, known, sheet, universe, stats)
+        for name in names
+    }
+    logger.info("Source outcomes: %s", outcomes)
+
+    # 4. Summary. Sent only when the run had something to report, so that
     #    silence reliably means "nothing new was filed":
     #      - never during seeding
     #      - not while quietly backfilling seeded filings
@@ -310,20 +330,31 @@ def run(args) -> int:
     logger.info("Run complete.\n%s", summary)
     if args.seed:
         logger.info("SEED MODE: no Telegram messages were sent, by design.")
-    elif notified or stats["notify_failed"]:
+    elif stats["notified"] or stats["notify_failed"]:
         telegram_send(summary, dry_run=args.dry_run)
     else:
         logger.info(
             "Nothing to alert on (%d filing(s) backfilled); no summary sent.",
-            len(queue),
+            stats["processed"],
         )
 
+    # 5. Exit code. Non-zero (a red Actions run) whenever a source was
+    #    skipped for a reason that needs attention, even though the other
+    #    sources completed normally.
+    if args.seed and all(o == "skipped" for o in outcomes.values()):
+        logger.error(
+            "ABORTING: every requested source is already seeded, so nothing "
+            "was seeded. Run without --seed for a normal incremental run."
+        )
+        return 1
+    if any(o in ("index_unavailable", "not_seeded", "sheets_error") for o in outcomes.values()):
+        return 1
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Track newly filed US House Periodic Transaction Reports."
+        description="Track newly filed congressional and executive-branch trade reports."
     )
     parser.add_argument(
         "--dry-run",
@@ -333,18 +364,25 @@ def main() -> int:
     parser.add_argument(
         "--seed",
         action="store_true",
-        help="First run: record the year to date, send no messages.",
+        help="Record each unseeded source's year to date, send no messages.",
     )
     parser.add_argument(
         "--force-reseed",
         action="store_true",
-        help="Allow --seed even though the sheet is already populated.",
+        help="Allow --seed for a source that already has rows in the sheet.",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["all", *SOURCES],
+        default="all",
+        help="Restrict the run to one source (default: every enabled source).",
     )
     parser.add_argument(
         "--year", type=int, default=None, help="Disclosure year (default: current year)."
     )
     parser.add_argument(
-        "--limit", type=int, default=None, help="Override the per-run PDF cap."
+        "--limit", type=int, default=None,
+        help="Override the per-source, per-run document cap.",
     )
     args = parser.parse_args()
 
